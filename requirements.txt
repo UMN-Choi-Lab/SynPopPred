@@ -1,0 +1,18 @@
+# Core
+pandas>=2.0
+numpy>=1.24
+scipy>=1.10
+pyarrow>=12.0
+
+# IPF baseline
+ipfn>=1.3
+
+# CTGAN baseline
+sdv>=1.10
+
+# PopLLM (LLM fine-tuning)
+torch>=2.0
+transformers>=4.40
+peft>=0.10
+datasets>=2.14
+accelerate>=0.28
