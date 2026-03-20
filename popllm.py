@@ -33,6 +33,7 @@ from transformers import (
 
 from config import CATEGORICAL_ATTRIBUTES, CENSUS_ATTRIBUTES, RANDOM_SEED
 from serializer import build_generation_prefix, parse_record, serialize_dataframe
+from era_context import ERA_NARRATIVES, build_era_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +132,7 @@ class PopLLMSynthesizer:
         batch_size: int = 32,
         learning_rate: float = 2e-4,
         output_dir: str = "checkpoints/popllm",
+        use_era_context: bool = False,
     ) -> "PopLLMSynthesizer":
         """Fine-tune the LLM on serialized census records.
 
@@ -139,7 +141,13 @@ class PopLLMSynthesizer:
             2. Tokenize the text sequences
             3. Apply LoRA adapters to the pretrained model
             4. Train with causal LM objective (next-token prediction)
+
+        Args:
+            use_era_context: If True, prepend era demographic narratives
+                (TFR, aging %, education trends) to each training record.
+                This provides temporal context for the LLM.
         """
+        self._use_era_context = use_era_context
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
 
@@ -171,12 +179,17 @@ class PopLLMSynthesizer:
         print(f"LoRA: {trainable:,} trainable / {total:,} total ({100*trainable/total:.2f}%)")
 
         # Serialize census records to natural language text
-        train_texts = serialize_dataframe(train_df, permute=True, seed=self.seed)
+        # If use_era_context=True, each record gets a demographic context prefix
+        train_texts = serialize_dataframe(
+            train_df, permute=True, seed=self.seed,
+            use_era_context=use_era_context)
         train_dataset = self._tokenize_texts(train_texts)
 
         val_dataset = None
         if val_df is not None:
-            val_texts = serialize_dataframe(val_df, permute=False, seed=self.seed)
+            val_texts = serialize_dataframe(
+                val_df, permute=False, seed=self.seed,
+                use_era_context=use_era_context)
             val_dataset = self._tokenize_texts(val_texts)
 
         # Train with HuggingFace Trainer
@@ -222,11 +235,13 @@ class PopLLMSynthesizer:
         top_k: int = 50,
         top_p: float = 0.95,
         batch_size: int = 64,
+        use_era_context: bool = False,
     ) -> pd.DataFrame:
         """Generate synthetic population records via auto-regressive sampling.
 
         Pipeline:
             1. Build a generation prefix: "In {year}, a resident of {region}..."
+               (optionally with era context: "[Context: TFR=0.84, elderly=15.7%...]")
             2. Feed prefix to the LLM, sample continuations
             3. Parse generated text back to structured records
             4. Filter out malformed or structurally invalid records
@@ -246,7 +261,11 @@ class PopLLMSynthesizer:
         if hasattr(self._model, "generation_config"):
             self._model.generation_config.max_length = None
 
-        prefix = build_generation_prefix(year=year, region=region)
+        # Build generation prefix — with era context if enabled
+        if use_era_context:
+            prefix = build_era_prefix(year=year, region=region)
+        else:
+            prefix = build_generation_prefix(year=year, region=region)
 
         # Allow up to 3x oversampling to account for parse failures
         max_batches = max(int(np.ceil(n_samples / batch_size)) * 3, 10)

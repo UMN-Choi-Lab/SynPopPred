@@ -127,7 +127,8 @@ def run_ctgan(train_df, target_df, target_year, n_samples):
 
 
 def run_llm(train_df, target_df, target_year, n_samples,
-            model_name="distilgpt2", label="DistilGPT-2"):
+            model_name="distilgpt2", label="DistilGPT-2",
+            use_era_context: bool = False):
     """Run PopLLM (LLM fine-tuning)."""
     print("\n" + "=" * 60)
     print(f"METHOD: PopLLM ({label})")
@@ -164,8 +165,10 @@ def run_llm(train_df, target_df, target_year, n_samples,
     else:
         train_sub = train_df
 
-    model.fit(train_sub, epochs=epochs, batch_size=batch_size)
-    syn_df = model.generate(n_samples, year=target_year, temperature=temp)
+    model.fit(train_sub, epochs=epochs, batch_size=batch_size,
+              use_era_context=use_era_context)
+    syn_df = model.generate(n_samples, year=target_year, temperature=temp,
+                            use_era_context=use_era_context)
     elapsed = time.time() - t0
 
     # Evaluate raw and with IPF reweighting
@@ -203,6 +206,9 @@ def main():
                         help="Path to data directory")
     parser.add_argument("--llama-model", default="unsloth/Meta-Llama-3.1-8B",
                         help="HuggingFace model ID for Llama")
+    parser.add_argument("--era-context", action="store_true",
+                        help="Enable era demographic context for PopLLM "
+                             "(prepends TFR, aging, education narratives)")
     args = parser.parse_args()
 
     train_df, target_df, target_year = load_data(args.data_dir)
@@ -219,12 +225,14 @@ def main():
 
     if "llm" in args.methods:
         r, _ = run_llm(train_df, target_df, target_year, args.n_samples,
-                       model_name="distilgpt2", label="DistilGPT-2")
+                       model_name="distilgpt2", label="DistilGPT-2",
+                       use_era_context=args.era_context)
         all_results.append(r)
 
     if "llama" in args.methods:
         r, _ = run_llm(train_df, target_df, target_year, args.n_samples,
-                       model_name=args.llama_model, label="Llama-3.1-8B")
+                       model_name=args.llama_model, label="Llama-3.1-8B",
+                       use_era_context=args.era_context)
         all_results.append(r)
 
     # Print comparison table
