@@ -58,6 +58,32 @@ python run_all.py --n-samples 1000
 python run_all.py --methods llama --llama-model meta-llama/Llama-3.1-8B
 ```
 
+### Best Configuration (Llama 8B, JSD=0.043)
+
+To reproduce the best result from 74 hyperparameter experiments:
+
+```bash
+# Full best config: Llama 8B + 8x oversampling
+# Requires 48 GB VRAM (RTX 6000 Ada), ~65 min training, ~160 min generation
+python run_all.py --methods llama --n-samples 25000 --oversample 8
+
+# Faster version: 2x oversampling (~40 min generation)
+python run_all.py --methods llama --n-samples 25000 --oversample 2
+
+# Quick test: small sample, no oversampling
+python run_all.py --methods llama --n-samples 1000
+```
+
+The optimized Llama 8B config is automatically applied when `--methods llama`:
+- **LoRA**: rank=32, alpha=32, targets=q/k/v/o_proj, rsLoRA enabled
+- **Training**: lr=1.5e-4, 2 epochs, cosine LR scheduler, weight_decay=0
+- **Generation**: temp=0.95, top_k=50, top_p=0.95
+- **Data**: Uses full training data (no subsampling) — older census waves help at lower lr
+- **Oversampling**: `--oversample N` generates N times more records for IPF pool
+
+Key insight: generating many more records than needed and letting IPF reweight
+the full pool is the single biggest quality improvement (JSD 0.062 → 0.043).
+
 ## Files
 
 | File | Description |
@@ -99,3 +125,27 @@ LoRA. Each record becomes a "sentence" like:
 
 The LLM learns P(attributes | year) through next-token prediction.
 At inference, we generate text completions and parse them back to records.
+
+## Hyperparameter Findings (from 74 automated experiments)
+
+| Parameter | Optimal | Impact |
+|-----------|---------|--------|
+| Learning rate | **1.5e-4** | Critical — broke the 0.069 JSD plateau (extremely sharp optimum) |
+| rsLoRA | **True** | Improves raw JSD from 0.120 → 0.088 |
+| Cosine LR | **Yes** | Additive benefit with rsLoRA |
+| Weight decay | **0.0** | Only helps with full data + lr=1.5e-4 |
+| LoRA rank | **32** | Sweet spot (16 too small, 48/64 no benefit) |
+| LoRA dropout | **0.05** | Critical — dropout=0 causes catastrophic collapse |
+| Temperature | **0.95** | Sharp optimum: 0.90 and 1.0 both worse |
+| Training data | **Full 124K** | Only helps at lr=1.5e-4 (at lr=2e-4, old data hurts) |
+| Epochs | **2** | 3 epochs overfits |
+| Oversampling | **8x** | 25K→0.062, 50K→0.053, 100K→0.046, 200K→0.043 |
+
+### What doesn't work
+- EOS token in training → 0% parse rate
+- Bayesian Network attribute ordering → breaks parsing
+- Repetition penalty → distorts distributions
+- Era context narratives → doubles sequence length, underfits at max_length=256
+  (may work with max_length=512, untested)
+- NEFTune noise → degrades joint distribution
+- Label smoothing → hurts categorical accuracy

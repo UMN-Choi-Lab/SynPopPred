@@ -38,6 +38,34 @@ from era_context import ERA_NARRATIVES, build_era_prefix
 logger = logging.getLogger(__name__)
 
 
+def _fuzzy_match_category(value: str, valid_categories: list[str]) -> str | None:
+    """Try to match a parsed value to a valid category using fuzzy heuristics.
+
+    Tries (in order): case-insensitive exact match, prefix match, and
+    reverse prefix match (for truncated generation). Returns the matched
+    category or None.
+
+    Examples:
+        "high school" -> "High school"  (case-insensitive)
+        "Elementary school dropout" -> "Elementary school"  (prefix)
+        "Profe" -> "Professionals"  (reverse prefix, truncated)
+    """
+    val_lower = value.lower().strip()
+    # Case-insensitive exact match
+    for cat in valid_categories:
+        if cat.lower() == val_lower:
+            return cat
+    # Prefix match: value starts with a valid category
+    for cat in valid_categories:
+        if val_lower.startswith(cat.lower()):
+            return cat
+    # Reverse prefix: valid category starts with value (truncated generation)
+    for cat in valid_categories:
+        if cat.lower().startswith(val_lower) and len(val_lower) >= 3:
+            return cat
+    return None
+
+
 def check_record_feasibility(record: dict) -> list[str]:
     """Check a record for structural zero violations.
 
@@ -91,8 +119,10 @@ class PopLLMSynthesizer:
         lora_rank: int = 16,
         lora_alpha: int = 32,
         lora_target_modules: list[str] | None = None,
-        max_length: int = 256,
+        lora_dropout: float = 0.05,
+        max_length: int = 512,
         seed: int = RANDOM_SEED,
+        use_rslora: bool = False,
     ):
         """Initialize PopLLM.
 
@@ -102,14 +132,22 @@ class PopLLMSynthesizer:
             lora_alpha: LoRA scaling factor (typically 2x rank).
             lora_target_modules: Which attention layers to adapt.
                 Default: ["c_attn"] for GPT-2, ["q_proj", "v_proj"] for Llama.
+            lora_dropout: LoRA dropout rate. 0.05 is critical — dropout=0
+                causes catastrophic collapse with Llama 8B.
             max_length: Max token sequence length.
             seed: Random seed for reproducibility.
+            use_rslora: Use Rank-Stabilized LoRA (rsLoRA). Instead of the
+                standard scaling alpha/rank, rsLoRA uses alpha/sqrt(rank),
+                which stabilizes training at higher ranks and improves
+                raw JSD quality significantly.
         """
         self.model_name = model_name
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
+        self.lora_dropout = lora_dropout
         self.max_length = max_length
         self.seed = seed
+        self.use_rslora = use_rslora
 
         # Auto-select LoRA target modules based on model architecture
         if lora_target_modules is not None:
@@ -133,6 +171,8 @@ class PopLLMSynthesizer:
         learning_rate: float = 2e-4,
         output_dir: str = "checkpoints/popllm",
         use_era_context: bool = False,
+        weight_decay: float = 0.01,
+        lr_scheduler_type: str = "linear",
     ) -> "PopLLMSynthesizer":
         """Fine-tune the LLM on serialized census records.
 
@@ -146,6 +186,11 @@ class PopLLMSynthesizer:
             use_era_context: If True, prepend era demographic narratives
                 (TFR, aging %, education trends) to each training record.
                 This provides temporal context for the LLM.
+            weight_decay: AdamW weight decay. Set to 0.0 for best results
+                with full training data + lr=1.5e-4 (allows LoRA adapters
+                to freely learn demographic patterns).
+            lr_scheduler_type: Learning rate schedule. "cosine" works best
+                with rsLoRA — additive improvement over "linear" default.
         """
         self._use_era_context = use_era_context
         torch.manual_seed(self.seed)
@@ -165,12 +210,15 @@ class PopLLMSynthesizer:
             self.model_name, **load_kwargs)
 
         # Apply LoRA — only fine-tunes a small number of parameters
+        # rsLoRA uses alpha/sqrt(rank) scaling instead of alpha/rank,
+        # stabilizing training at higher ranks
         lora_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             r=self.lora_rank,
             lora_alpha=self.lora_alpha,
-            lora_dropout=0.05,
+            lora_dropout=self.lora_dropout,
             target_modules=self.lora_target_modules,
+            use_rslora=self.use_rslora,
         )
         self._model = get_peft_model(base_model, lora_config)
 
@@ -198,7 +246,8 @@ class PopLLMSynthesizer:
             num_train_epochs=epochs,
             per_device_train_batch_size=batch_size,
             learning_rate=learning_rate,
-            weight_decay=0.01,
+            weight_decay=weight_decay,
+            lr_scheduler_type=lr_scheduler_type,
             warmup_ratio=0.1,
             logging_steps=50,
             save_strategy="epoch",
@@ -334,12 +383,19 @@ class PopLLMSynthesizer:
                 n_failed += 1
                 continue
 
-            # Validate attribute values are in allowed set
+            # Validate attribute values with fuzzy recovery for near-misses
+            # (e.g., "high school" -> "High school", "Profe" -> "Professionals")
             valid = True
             for attr in CENSUS_ATTRIBUTES:
-                if record[attr] not in CATEGORICAL_ATTRIBUTES[attr]:
-                    valid = False
-                    break
+                val = record[attr]
+                valid_cats = CATEGORICAL_ATTRIBUTES[attr]
+                if val not in valid_cats:
+                    matched = _fuzzy_match_category(val, valid_cats)
+                    if matched is not None:
+                        record[attr] = matched
+                    else:
+                        valid = False
+                        break
             if not valid:
                 n_failed += 1
                 continue

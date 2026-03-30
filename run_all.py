@@ -128,8 +128,16 @@ def run_ctgan(train_df, target_df, target_year, n_samples):
 
 def run_llm(train_df, target_df, target_year, n_samples,
             model_name="distilgpt2", label="DistilGPT-2",
-            use_era_context: bool = False):
-    """Run PopLLM (LLM fine-tuning)."""
+            use_era_context: bool = False,
+            oversample_factor: int = 1):
+    """Run PopLLM (LLM fine-tuning).
+
+    Args:
+        oversample_factor: Generate this many times more records than
+            n_samples, then let IPF reweight the full pool. Higher values
+            give IPF more diverse records to work with, significantly
+            improving JSD. Best result used 8x oversampling.
+    """
     print("\n" + "=" * 60)
     print(f"METHOD: PopLLM ({label})")
     print("=" * 60)
@@ -141,13 +149,21 @@ def run_llm(train_df, target_df, target_year, n_samples,
         lora_rank, lora_alpha = 16, 32
         lora_targets = ["c_attn"]
         batch_size, epochs = 32, 5
-        temp = 0.8
+        lr, temp = 2e-4, 0.8
+        use_rslora = False
+        weight_decay = 0.01
+        lr_scheduler = "linear"
     else:
-        # Llama 8B: use optimized config from autoresearch
+        # Llama 8B: optimized config from 74 autoresearch experiments
+        # Key findings: lr=1.5e-4 (sharp optimum), rsLoRA, cosine LR,
+        # weight_decay=0, full training data, temp=0.95
         lora_rank, lora_alpha = 32, 32
         lora_targets = ["q_proj", "k_proj", "v_proj", "o_proj"]
         batch_size, epochs = 16, 2
-        temp = 0.95
+        lr, temp = 1.5e-4, 0.95
+        use_rslora = True
+        weight_decay = 0.0
+        lr_scheduler = "cosine"
 
     t0 = time.time()
     model = PopLLMSynthesizer(
@@ -155,19 +171,28 @@ def run_llm(train_df, target_df, target_year, n_samples,
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
         lora_target_modules=lora_targets,
+        use_rslora=use_rslora,
     )
 
     # Subsample training data for speed (optional)
+    # Note: for Llama 8B at lr=1.5e-4, using ALL training data helps
+    # (older census waves add temporal diversity that the lower lr exploits)
     if len(train_df) > 20000 and "gpt2" in model_name.lower():
         train_sub = train_df.sample(n=20000, random_state=42)
-    elif len(train_df) > 80000:
-        train_sub = train_df.sample(n=80000, random_state=42)
     else:
-        train_sub = train_df
+        train_sub = train_df  # Use full data for Llama 8B
 
     model.fit(train_sub, epochs=epochs, batch_size=batch_size,
+              learning_rate=lr, weight_decay=weight_decay,
+              lr_scheduler_type=lr_scheduler,
               use_era_context=use_era_context)
-    syn_df = model.generate(n_samples, year=target_year, temperature=temp,
+
+    # Generate with oversampling for IPF pool
+    gen_count = n_samples * oversample_factor
+    if oversample_factor > 1:
+        print(f"  Oversampling: generating {gen_count:,} records "
+              f"({oversample_factor}x) for IPF pool")
+    syn_df = model.generate(gen_count, year=target_year, temperature=temp,
                             use_era_context=use_era_context)
     elapsed = time.time() - t0
 
@@ -182,7 +207,7 @@ def run_llm(train_df, target_df, target_year, n_samples,
         "method": label,
         "time_sec": elapsed,
         "n_generated": len(syn_df),
-        "parse_rate": len(syn_df) / max(n_samples, 1),
+        "parse_rate": len(syn_df) / max(gen_count, 1),
         "srmse_avg": results_raw["srmse_avg"],
         "jsd_full_joint": results_raw["jsd_full_joint"],
         "srmse_avg_ipf": results_ipf["srmse_avg"],
@@ -209,6 +234,10 @@ def main():
     parser.add_argument("--era-context", action="store_true",
                         help="Enable era demographic context for PopLLM "
                              "(prepends TFR, aging, education narratives)")
+    parser.add_argument("--oversample", type=int, default=1,
+                        help="Oversample factor for PopLLM generation. "
+                             "Generate N*oversample records, then IPF reweights "
+                             "the full pool. Best result used 8x. (default: 1)")
     args = parser.parse_args()
 
     train_df, target_df, target_year = load_data(args.data_dir)
@@ -226,13 +255,15 @@ def main():
     if "llm" in args.methods:
         r, _ = run_llm(train_df, target_df, target_year, args.n_samples,
                        model_name="distilgpt2", label="DistilGPT-2",
-                       use_era_context=args.era_context)
+                       use_era_context=args.era_context,
+                       oversample_factor=args.oversample)
         all_results.append(r)
 
     if "llama" in args.methods:
         r, _ = run_llm(train_df, target_df, target_year, args.n_samples,
                        model_name=args.llama_model, label="Llama-3.1-8B",
-                       use_era_context=args.era_context)
+                       use_era_context=args.era_context,
+                       oversample_factor=args.oversample)
         all_results.append(r)
 
     # Print comparison table
